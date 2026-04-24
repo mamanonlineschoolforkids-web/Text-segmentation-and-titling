@@ -1,26 +1,93 @@
-from fastapi import FastAPI, HTTPException, Header
+"""
+api.py — Transcription Segmentation REST API
+=============================================
+Endpoints:
+  POST /transcript                    — submit transcript, returns job_id
+  GET  /transcript/{job_id}           — full result (titles + segments + summaries)
+  GET  /transcript/{job_id}/titles    — only topic titles
+  GET  /transcript/{job_id}/segments  — only segment texts
+  GET  /transcript/{job_id}/summaries — only summaries
+
+Run:
+  uvicorn api:app --reload
+"""
+
+import os
+import uuid
+from typing import Optional
+from pathlib import Path
+
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Optional
-import os
 
-from autoChapters import (
-    segment_by_topic,
-    cosine_segment,
-    call_openrouter,
-    build_prompt,
-    parse_response,
-    apply_grouping,
-    is_arabic,
-    estimate_tokens,
-    get_labels,
-)
-import autoChapters as pipeline
+from core import run_pipeline
+
+load_dotenv(Path(__file__).parent / ".env")
+
+
+# ─────────────────────────────────────────────
+# CONFIG — edit these values directly
+# ─────────────────────────────────────────────
+
+GROQ_MODEL = "llama-3.3-70b-versatile"
+
+# ─────────────────────────────────────────────
+# In-memory job store  { job_id: dict }
+# ─────────────────────────────────────────────
+
+store: dict[str, dict] = {}
+
+
+# ─────────────────────────────────────────────
+# Pydantic response models
+# ─────────────────────────────────────────────
+
+class SegmentOut(BaseModel):
+    index: int
+    title: str
+    summary: str
+    text: str
+    start_line: int
+    end_line: int
+
+
+class TranscriptResult(BaseModel):
+    job_id: str
+    status: str
+    segments: list[SegmentOut] = []
+    error: Optional[str] = None
+
+
+class TitlesResult(BaseModel):
+    job_id: str
+    titles: list[str]
+
+
+class SegmentsResult(BaseModel):
+    job_id: str
+    segments: list[dict]
+
+
+class SummariesResult(BaseModel):
+    job_id: str
+    summaries: list[dict]
+
+
+class SubmitResponse(BaseModel):
+    job_id: str
+    message: str
+
+
+# ─────────────────────────────────────────────
+# App
+# ─────────────────────────────────────────────
 
 app = FastAPI(
-    title="Topic Segmentation API",
-    description="API لتقسيم النصوص العربية والإنجليزية حسب الموضوع",
-    version="1.0.0"
+    title="Transcription Segmentation API",
+    description="Segment transcripts by topic using Groq LLM.",
+    version="2.0.0",
 )
 
 app.add_middleware(
@@ -30,96 +97,119 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Load API key from environment ──────────────────────────────────────────────
-pipeline.OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 
+# ─────────────────────────────────────────────
+# Endpoints
+# ─────────────────────────────────────────────
 
-# ── Request models ─────────────────────────────────────────────────────────────
+@app.post("/transcript", response_model=SubmitResponse, status_code=202)
+async def submit_transcript(
+    text: Optional[str] = Form(default=None),
+    file: Optional[UploadFile] = File(default=None),
+):
+    """
+    Submit a transcript for processing.
+    Send either a `text` form field or a `file` (.txt) upload.
+    Returns a `job_id` to use with the GET endpoints.
+    """
+    if file:
+        content    = await file.read()
+        transcript = content.decode("utf-8")
+    elif text:
+        transcript = text
+    else:
+        raise HTTPException(status_code=400, detail="Provide either 'text' or 'file'.")
 
-class SegmentRequest(BaseModel):
-    text: str
-    model: Optional[str] = "openai/gpt-oss-20b"
-    min_segment_sentences: Optional[int] = 2
-    arabic_chunk_words: Optional[int] = 30
+    groq_api_key = os.getenv("GROQ_API_KEY")
+    if not groq_api_key:
+        raise HTTPException(status_code=500, detail="GROQ_API_KEY not set in .env file.")
 
-class CosineRequest(BaseModel):
-    text: str
-    min_segment_sentences: Optional[int] = 2
-    arabic_chunk_words: Optional[int] = 30
-
-class GroupRequest(BaseModel):
-    segments: List[str]
-    model: Optional[str] = "openai/gpt-oss-20b"
-
-
-# ── Helper ─────────────────────────────────────────────────────────────────────
-
-def apply_config(req):
-    if req.min_segment_sentences:
-        pipeline.MIN_SEGMENT_SENTENCES = req.min_segment_sentences
-    if hasattr(req, "arabic_chunk_words") and req.arabic_chunk_words:
-        pipeline.ARABIC_SPEECH_CHUNK_WORDS = req.arabic_chunk_words
-    if req.model:
-        pipeline.MODEL = req.model
-
-
-# ── Endpoints ──────────────────────────────────────────────────────────────────
-
-@app.get("/")
-def root():
-    return {"message": "Topic Segmentation API is running"}
-
-
-@app.post("/segment")
-def segment(req: SegmentRequest):
-    if not pipeline.OPENROUTER_API_KEY:
-        raise HTTPException(status_code=401, detail="OPENROUTER_API_KEY غير موجود في البيئة")
-    apply_config(req)
-    try:
-        results = segment_by_topic(req.text, verbose=False)
-    except ValueError as e:
-        raise HTTPException(status_code=422, detail=str(e))
-    return {
-        "language": "Arabic" if is_arabic(req.text) else "English",
-        "segments_count": len(results),
-        "segments": results,
-        "labels": get_labels(results),
-    }
-
-
-@app.post("/segment/cosine")
-def segment_cosine(req: CosineRequest):
-    apply_config(req)
-    segments = cosine_segment(req.text)
-    return {
-        "language": "Arabic" if is_arabic(req.text) else "English",
-        "segments_count": len(segments),
-        "segments": segments,
-    }
-
-
-@app.post("/segment/group")
-def segment_group(req: GroupRequest):
-    if not pipeline.OPENROUTER_API_KEY:
-        raise HTTPException(status_code=401, detail="OPENROUTER_API_KEY غير موجود في البيئة")
-    if req.model:
-        pipeline.MODEL = req.model
-
-    arabic = is_arabic(" ".join(req.segments))
-    prompt = build_prompt(req.segments, arabic=arabic)
-
-    if estimate_tokens(prompt) > 100_000:
-        raise HTTPException(status_code=422, detail="المقاطع كبيرة جداً، قلل حجم النص")
+    job_id = str(uuid.uuid4())
+    store[job_id] = {"status": "processing", "segments": []}
 
     try:
-        raw       = call_openrouter(prompt)
-        decisions = parse_response(raw)
-        results   = apply_grouping(req.segments, decisions)
-    except ValueError as e:
-        raise HTTPException(status_code=422, detail=str(e))
+        segments = run_pipeline(
+            transcript=transcript,
+            groq_api_key=groq_api_key,
+            groq_model=GROQ_MODEL,
+        )
+        store[job_id] = {
+            "status": "done",
+            "segments": [
+                {
+                    "index": seg.index,
+                    "title": seg.title,
+                    "summary": seg.summary,
+                    "text": seg.text,
+                    "start_line": seg.start_line,
+                    "end_line": seg.end_line,
+                }
+                for seg in segments
+            ],
+        }
+    except Exception as e:
+        store[job_id] = {"status": "error", "segments": [], "error": str(e)}
+        raise HTTPException(status_code=500, detail=str(e))
 
-    return {
-        "segments_count": len(results),
-        "segments": results,
-        "labels": get_labels(results),
-    }
+    return SubmitResponse(job_id=job_id, message="Processing complete.")
+
+
+@app.get("/transcript/{job_id}", response_model=TranscriptResult)
+def get_transcript(job_id: str):
+    """Full result — titles, summaries, and segment texts."""
+    job = _get_job(job_id)
+    return TranscriptResult(
+        job_id=job_id,
+        status=job["status"],
+        segments=[SegmentOut(**s) for s in job["segments"]],
+        error=job.get("error"),
+    )
+
+
+@app.get("/transcript/{job_id}/titles", response_model=TitlesResult)
+def get_titles(job_id: str):
+    """Only the topic title for each segment, in order."""
+    job = _get_job(job_id)
+    return TitlesResult(
+        job_id=job_id,
+        titles=[s["title"] for s in job["segments"]],
+    )
+
+
+@app.get("/transcript/{job_id}/segments", response_model=SegmentsResult)
+def get_segments(job_id: str):
+    """Only the text content of each segment."""
+    job = _get_job(job_id)
+    return SegmentsResult(
+        job_id=job_id,
+        segments=[
+            {"index": s["index"], "title": s["title"], "text": s["text"]}
+            for s in job["segments"]
+        ],
+    )
+
+
+@app.get("/transcript/{job_id}/summaries", response_model=SummariesResult)
+def get_summaries(job_id: str):
+    """Only the summary for each segment."""
+    job = _get_job(job_id)
+    return SummariesResult(
+        job_id=job_id,
+        summaries=[
+            {"index": s["index"], "title": s["title"], "summary": s["summary"]}
+            for s in job["segments"]
+        ],
+    )
+
+
+# ─────────────────────────────────────────────
+# Helper
+# ─────────────────────────────────────────────
+
+def _get_job(job_id: str) -> dict:
+    job = store.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
+    if job["status"] == "error":
+        raise HTTPException(status_code=500, detail=job.get("error", "Pipeline failed."))
+    return job
