@@ -23,7 +23,7 @@ load_dotenv(Path(__file__).parent / ".env")
 # CONFIG — edit these values directly
 # ─────────────────────────────────────────────
 
-TRANSCRIPT_FILE = "transcription.txt"
+TRANSCRIPT_FILE = "transcript.txt"
 
 # Groq model to use
 # Options: "llama-3.3-70b-versatile" | "llama-3.1-8b-instant" | "mixtral-8x7b-32768"
